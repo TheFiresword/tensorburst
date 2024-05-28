@@ -2,12 +2,63 @@ import random
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, ConnectionPatch
 import pickle
 import seaborn as sn
 from tqdm import tqdm
 from enum import Enum
 import copy
+
+def identity(input : np.ndarray):
+    return input
+def relu(input: np.ndarray):        
+    return np.maximum(0, input)
+def tanh(input : np.ndarray):
+    return np.tanh(input)
+def sigmoid(input: np.ndarray):
+    return 1 / (1 + np.exp(-input))
+def softmax(input: np.ndarray):
+    input = np.exp(input-np.max(input, axis=-1, keepdims=True)) # Normalization term to avoid unbalanced output
+    return input / np.sum(input, axis=-1, keepdims=True)
+
+def didentity(activation: np.ndarray):
+    return np.ones(activation.shape)
+def drelu(activation: np.ndarray):        
+    return activation>0
+def dtanh(activation : np.ndarray):
+    return 1 - np.square(activation)
+def dsigmoid(activation: np.ndarray):
+    return activation*(1-activation)
+def dsoftmax(activation: np.ndarray):
+    return activation*(1-activation)
+
+def orthogonal_initializer(shape, gain=1.0):
+    """
+    Orthogonal initialization for the recurrent weights.
+    """
+    if len(shape) < 2:
+        raise ValueError("The tensor to initialize must be at least two-dimensional")
+    flat_shape = (shape[0], np.prod(shape[1:]))
+    a = np.random.randn(*flat_shape)
+    u, _, v = np.linalg.svd(a, full_matrices=False)
+    q = u if u.shape == flat_shape else v
+    q = q.reshape(shape)
+    return gain * q
+
+def glorot_uniform_initializer(shape):
+    """
+    Glorot Uniform initializer.
+    """
+    fan_in, fan_out = shape[0], shape[1]
+    limit = np.sqrt(6 / (fan_in + fan_out))
+    return np.random.uniform(-limit, limit, size=shape)
+
+def glorot_normal_initializer(shape):
+    """
+    Initialize a weight matrix using Glorot Normal (Xavier Normal) initialization.
+    """
+    fan_in, fan_out = shape[0], shape[1]
+    stddev = np.sqrt(2.0 / (fan_in + fan_out))
+    return np.random.normal(loc=0.0, scale=stddev, size=shape)
 
 class Color(Enum): # Colors code to display metrics
     red = "\033[31m"
@@ -25,10 +76,36 @@ class Usage(Enum): # NN usages
     logisticRegression = "logisticRegression"
     multiClassification = "multiClassification"
     regression = "regression"
+
+class Activation(Enum):
+    identity = "identity"
+    relu = "reLu",
+    sigmoid = "sigmoid",
+    tanh = "tanh",
+    softmax = "softmax"
     
+class RnnArchitecture(Enum):
+    one_to_one = "one_to_one"
+    many_to_one = "many_to_one"
+    one_to_many = "one_to_many"
+    many_to_many = "many_to_many"
+
 class Processing():
     def __init__(self) -> None:
         pass
+    
+    def one_hot_encode_text(corpus : list , vocab_size : int):
+        words_to_index = {}
+        indexes = [[] for _ in range(len(corpus))]
+        tokenized_corpus = [str(sentence).split(sep=' ') for sentence in corpus]
+        for sentence in tokenized_corpus:    
+            for word in sentence:
+                if word not in words_to_index:
+                    words_to_index[word] = random.randint(1, vocab_size-1)                    
+        for i, sentence in enumerate(tokenized_corpus):
+            for word in sentence:
+                indexes[i].append(words_to_index[word])
+        return indexes
     
     def one_hot_encode(data: list | np.ndarray):
         unique_data = np.unique(data)
@@ -102,7 +179,9 @@ class Metric:
         
     def __call__(self, predictions:np.ndarray, labels:np.ndarray, 
                  usage : Usage = Usage.logisticRegression):        
-        if usage == Usage.logisticRegression: predictions = np.rint(predictions)
+        if usage == Usage.logisticRegression: 
+            predictions = np.rint(predictions).astype(int)
+            labels = np.rint(labels).astype(int)
         if usage == Usage.multiClassification: # Predictions are softmax outputs
             predictions, labels = Processing.one_hot_decode(predictions), Processing.one_hot_decode(labels)
         predictions, labels = predictions.flatten(), labels.flatten()
@@ -114,7 +193,7 @@ class Accuracy(Metric):
         
     def __call__(self, predictions:np.ndarray, labels:np.ndarray, 
                  usage : Usage = Usage.logisticRegression, verbose:bool=True):
-        predictions, labels = super().__call__(predictions, labels, usage)
+        predictions, labels = super().__call__(predictions, labels, usage)        
         self.output = np.equal(predictions, labels).sum() / labels.shape[0]
         if verbose: print(f" {Color.red if self.output < 0.5 else Color.green}accuracy: {self.output} {Color.reset} ")
         return self.output     
@@ -127,7 +206,7 @@ class ConfusionMatrix(Metric):
                  usage : Usage = Usage.multiClassification, verbose:bool=True):
         # Only single label
         predictions, labels = super().__call__(predictions, labels, usage)
-        "positive|negative" + "true|false"
+        # "positive|negative" + "true|false"
         matrix = np.zeros((len(classes), len(classes)))
         for l, p in zip(labels, predictions):
             matrix[p, l] += 1
@@ -200,7 +279,7 @@ class Regularizer:
         self.gradient_regularization = 0
         self.loss_regularization = 0
     
-    def loss_reg(self, all_kernels: np.array) -> float:
+    def loss_reg(self, all_kernels: np.ndarray) -> float:
         all_kernels = np.concatenate([kernel.ravel() for kernel in all_kernels])
         match self.name:
             case 'ridge':
@@ -214,7 +293,7 @@ class Regularizer:
                 return
         return self.loss_regularization
     
-    def gradients_reg(self, kernel: np.array) -> np.array:
+    def gradients_reg(self, kernel: np.ndarray) -> np.ndarray:
         match self.name:
             case 'ridge':
                 self.gradient_regularization = 2*self.alpha*kernel
@@ -226,40 +305,42 @@ class Regularizer:
 
 
 class Loss:
-    def __init__(self, loss_function="l2") -> None:
+    def __init__(self, loss_function : str ="l2", epsilon : float = 1e-12) -> None:
         self.loss_fn = loss_function
+        self.epsilon = epsilon
         self.error = None
         self.dLoss_per_prediction = None
     
     def __call__(self, y_predicted: np.ndarray, y_recorded: np.ndarray) -> tuple[float, np.ndarray]:
+        # y_predicted and y_recorded should have shape (batch, *)
+        batch_size = len(y_predicted)
         match self.loss_fn:
             case "l0-1":
                 self.dLoss_per_prediction = 0
-                self.error =  np.where(y_recorded != y_predicted, 1, 0).sum(axis=-1)
+                self.error =  np.where(y_recorded != y_predicted, 1, 0).sum(axis=tuple(range(1, y_predicted.ndim)))
             case "hinge":
-                self.dLoss_per_prediction = np.where(1-y_recorded*y_predicted >=0, -y_recorded, 0)
-                self.error = np.maximum(0, 1-y_recorded*y_predicted).sum(axis=-1)            
+                self.dLoss_per_prediction =  np.where(1-y_recorded*y_predicted >=0, -y_recorded, 0)
+                self.error = np.maximum(0, 1-y_recorded*y_predicted).sum(axis=tuple(range(1, y_predicted.ndim)))            
             case "l2" | "quadratic":
                 self.dLoss_per_prediction = 2*(y_predicted-y_recorded)
-                self.error = np.square(y_predicted-y_recorded).sum(axis=-1)
+                self.error = np.square(y_predicted-y_recorded).sum(axis=tuple(range(1, y_predicted.ndim)))
             case "l1":
                 self.dLoss_per_prediction = np.sign(y_predicted)
-                self.error = np.absolute(y_recorded-y_predicted).sum(axis=-1)
+                self.error = np.absolute(y_recorded-y_predicted).sum(axis=tuple(range(1, y_predicted.ndim)))
             case "binary_cross_entropy":
                 assert len(y_recorded.shape) >= 2 and y_recorded.shape[-1] == 1
-                epsilon = 1e-7
                 # Clipping y_predicted to avoid log(0)
-                y_predicted = np.clip(y_predicted, epsilon, 1 - epsilon)
+                y_predicted = np.clip(y_predicted, self.epsilon, 1 - self.epsilon)
                 self.dLoss_per_prediction = (y_predicted-y_recorded) / (y_predicted * (1- y_predicted))
-                self.error = - (y_recorded * np.log(y_predicted) + (1 - y_recorded) * np.log(1 - y_predicted)).sum(axis=-1)               
+                self.error = - (y_recorded * np.log(y_predicted) + (1 - y_recorded) * np.log(1 - y_predicted)).sum(axis=tuple(range(1, y_predicted.ndim)))               
             case "categorical_cross_entropy":
                 assert len(y_recorded.shape) >= 2 and y_recorded.shape[-1] > 1
                 assert np.min(y_predicted) >= 0 and np.max(y_predicted) <= 1
-                epsilon = 1e-7
-                y_predicted = np.clip(y_predicted, epsilon, 1 - epsilon)
-                self.dLoss_per_prediction = (y_predicted - y_recorded) / y_recorded.shape[-1]
-                self.error = (-y_recorded * np.log(y_predicted)).sum(axis=-1)
-        self.error = np.mean(self.error, axis=0)
+                y_predicted = np.clip(y_predicted, self.epsilon, 1 - self.epsilon)
+                self.dLoss_per_prediction = (y_predicted - y_recorded) # / y_recorded.shape[-1]
+                self.error = (-y_recorded * np.log(y_predicted)).sum(axis=tuple(range(1, y_predicted.ndim)))
+        self.error = np.mean(self.error)
+        self.dLoss_per_prediction /= batch_size
         return self.error, self.dLoss_per_prediction
 
 
@@ -371,17 +452,13 @@ d.evolution()
 '''
 
 class Optimizer:
-    def __init__(self, lr : float | LearningRateScheduler=0.01, epsilon:float=1e-7) -> None:
+    def __init__(self, lr : float | LearningRateScheduler=0.01, epsilon:float=1e-12) -> None:
         if not isinstance(lr, LearningRateScheduler): lr = LearningRateScheduler(lr)
         self.lr = lr
         self.epsilon = epsilon
         
-    def get_gradients(self, nn_cache: list[dict], num_layer: int, epoch: int = None)->np.ndarray:
-        return nn_cache[epoch]['gradients'][num_layer]
-    
-    def __call__(self, nn_cache: list[dict], num_layer: int, step : int)->np.ndarray:
-        gradient_W, gradient_biases = self.get_gradients(nn_cache, num_layer, len(nn_cache)-1)
-        return self.lr(step) * gradient_W, self.lr(step) * gradient_biases
+    def __call__(self, gradients: np.ndarray, num_layer: int, step : int, epoch : int = None)->np.ndarray:
+        return [self.lr(step) * gradient for gradient in gradients]
 
     def show_lr_evolution(self):
         self.lr.evolution()
@@ -392,129 +469,79 @@ class Momentum(Optimizer):
         self.alpha = alpha
         self.previous_updates = {}
         
-    def __call__(self, nn_cache: list[dict], num_layer: int, step : int):        
-        (gradient_W, gradient_biases) = self.get_gradients(nn_cache, num_layer, len(nn_cache)-1)
+    def __call__(self, gradients: np.ndarray, num_layer: int, step : int, epoch : int = None):        
         if num_layer not in self.previous_updates:
-            self.previous_updates[num_layer] = {
-                'W': np.zeros_like(gradient_W),
-                'biases': np.zeros_like(gradient_biases)
-            }
+            self.previous_updates[num_layer] = [np.zeros_like(gradient) for gradient in gradients]
         previous_update = self.previous_updates[num_layer]
-        gradient_W = self.alpha * previous_update['W'] + self.lr(step) * gradient_W
-        gradient_biases = self.alpha * previous_update['biases'] + self.lr(step) * gradient_biases
-        self.previous_updates[num_layer]['W'], self.previous_updates[num_layer]['biases'] = gradient_W, gradient_biases
-        return gradient_W, gradient_biases
+        optim_gradients = [self.lr(step) * gradients[i]  + self.alpha * previous_update[i] for i in range(len(gradients))]
+        self.previous_updates[num_layer] = optim_gradients
+        return optim_gradients
     
 class Adam(Optimizer):
-    def __init__(self, beta_1: float = 0.9, beta_2: float=0.999, lr : float| LearningRateScheduler = 0.01, epsilon:float=1e-7) -> None:
+    def __init__(self, beta_1: float = 0.9, beta_2: float=0.999, lr : float| LearningRateScheduler = 0.01, epsilon:float=1e-12) -> None:
         super().__init__(lr, epsilon)
         self.beta_1, self.beta_2 = beta_1, beta_2
         self.square_sums = {}
         self.linear_sums = {}
         
-    def __call__(self, nn_cache: list[dict], num_layer: int, step : int):
-        epoch = len(nn_cache)-1
-        (gradient_W, gradient_biases) = self.get_gradients(nn_cache, num_layer, epoch)
+    def __call__(self, gradients: np.ndarray, num_layer: int, step : int, epoch : int):
         if num_layer not in self.square_sums:
-            self.square_sums[num_layer] = {
-                'W': np.zeros_like(gradient_W),
-                'biases': np.zeros_like(gradient_biases)
-            }
+            self.square_sums[num_layer] = [np.zeros_like(gradient) for gradient in gradients]
         if num_layer not in self.linear_sums:
-            self.linear_sums[num_layer] = {
-                'W': np.zeros_like(gradient_W),
-                'biases': np.zeros_like(gradient_biases)
-            }
-        self.square_sums[num_layer]['W'] = self.beta_2*self.square_sums[num_layer]['W'] + \
-            (1-self.beta_2)*np.square(gradient_W)
-        self.square_sums[num_layer]['biases'] = self.beta_2*self.square_sums[num_layer]['biases'] + \
-            (1-self.beta_2)*np.square(gradient_biases)
+            self.linear_sums[num_layer] = [np.zeros_like(gradient) for gradient in gradients]
         
-        self.linear_sums[num_layer]['W'] = self.beta_1*self.linear_sums[num_layer]['W'] + \
-            (1-self.beta_1)*gradient_W
-        self.linear_sums[num_layer]['biases'] = self.beta_1*self.linear_sums[num_layer]['biases'] + \
-            (1-self.beta_1)*gradient_biases
+        self.square_sums[num_layer] = [self.beta_2 * self.square_sums[num_layer][i] + 
+                                       (1-self.beta_2)*np.square(gradients[i]) for i in range(len(gradients))]
+        
+        self.linear_sums[num_layer] = [self.beta_1*self.linear_sums[num_layer][i] + 
+                                       (1-self.beta_1)*gradients[i] for i in range(len(gradients))]
         
         square_sum, linear_sum = self.square_sums[num_layer], self.linear_sums[num_layer]
         
-        first_momentum = ((linear_sum['W'] / (1 - self.beta_1**epoch)), (linear_sum['biases'] / (1 - self.beta_1**epoch)))
+        first_momentum = [(linear_sum[i] / (1 - self.beta_1**(step+1))) for i in range(len(gradients))]
         
-        second_momentum = ((square_sum['W'] / (1 - self.beta_2**epoch)), (square_sum['biases'] / (1 - self.beta_2**epoch)))
+        second_momentum = [(square_sum[i] / (1 - self.beta_2**(step+1))) for i in range(len(gradients))]
         
-        gradient_W = self.lr(step) * first_momentum[0] / (self.epsilon + np.sqrt(second_momentum[0]))
-        gradient_biases = self.lr(step) * first_momentum[1] / (self.epsilon + np.sqrt(second_momentum[1]))
-        return gradient_W, gradient_biases
+        optim_gradients = [self.lr(step) * first_momentum[i] / (self.epsilon + np.sqrt(second_momentum[i])) for i in range(len(gradients))]
+        return optim_gradients
     
 class Adagrad(Optimizer):
-    def __init__(self, lr: float=0.01, epsilon:float=1e-7) -> None:
+    def __init__(self, lr: float=0.01, epsilon:float=1e-12) -> None:
         super().__init__(lr, epsilon)
         self.square_sums = {}
         
-    def __call__(self, nn_cache: list[dict], num_layer: int, step : int):
-        (gradient_W, gradient_biases) = self.get_gradients(nn_cache, num_layer, len(nn_cache)-1)
+    def __call__(self, gradients: np.ndarray, num_layer: int, step : int, epoch : int = None):
         if num_layer not in self.square_sums:
-            self.square_sums[num_layer] = {
-                'W': np.zeros_like(gradient_W),
-                'biases': np.zeros_like(gradient_biases)
-            }
-        self.square_sums[num_layer]['W'] += np.square(gradient_W)
-        self.square_sums[num_layer]['biases'] += np.square(gradient_biases)
+            self.square_sums[num_layer] = [np.zeros_like(gradient) for gradient in gradients]
+        self.square_sums[num_layer] = [self.square_sums[num_layer][i] + np.square(gradients[i]) for i in range(len(gradients))]
         square_sum = self.square_sums[num_layer]
-        gradient_W = gradient_W*self.lr(step)/(self.epsilon + np.sqrt(square_sum['W']))
-        gradient_biases = gradient_biases*self.lr(step)/(self.epsilon + np.sqrt(square_sum['biases']))        
-        return gradient_W, gradient_biases
+        optim_gradients = [gradients[i]*self.lr(step) / (self.epsilon + np.sqrt(square_sum[i])) for i in range(len(gradients))]
+        return optim_gradients
     
 class RMSprop(Optimizer):
-    def __init__(self, beta: float=0.9, lr: float=0.01, epsilon:float=1e-7) -> None:
+    def __init__(self, beta: float=0.9, lr: float=0.01, epsilon:float=1e-12) -> None:
         super().__init__(lr, epsilon)
         self.beta = beta
         self.square_sums = {}
 
-    def __call__(self, nn_cache: list[dict], num_layer: int, step : int):
-        (gradient_W, gradient_biases) = self.get_gradients(nn_cache, num_layer, len(nn_cache)-1)
+    def __call__(self, gradients: np.ndarray, num_layer: int, step : int, epoch : int = None):
         if num_layer not in self.square_sums:
-            self.square_sums[num_layer] = {
-                'W': np.zeros_like(gradient_W),
-                'biases': np.zeros_like(gradient_biases)
-            }
-        self.square_sums[num_layer]['W'] = self.beta*self.square_sums[num_layer]['W'] + (1-self.beta)*np.square(gradient_W)
-        self.square_sums[num_layer]['biases'] = self.beta*self.square_sums[num_layer]['biases'] + (1-self.beta)*np.square(gradient_biases)
+            self.square_sums[num_layer] = [np.zeros_like(gradient) for gradient in gradients]
+        self.square_sums[num_layer] = [self.beta*self.square_sums[num_layer][i] + 
+                                       (1-self.beta)*np.square(gradients[i]) for i in range(len(gradients))]
         square_sum = self.square_sums[num_layer]
-        gradient_W = gradient_W*self.lr(step)/(self.epsilon + np.sqrt(square_sum['W']))
-        gradient_biases = gradient_biases*self.lr(step)/(self.epsilon + np.sqrt(square_sum['biases']))        
-        return gradient_W, gradient_biases
+        optim_gradients = [gradients[i]*self.lr(step)/(self.epsilon + np.sqrt(square_sum[i])) for i in range(len(gradients))]
+        return optim_gradients
 
    
-class Activation:
-    def relu(x: np.ndarray):        
-        return np.maximum(0, x)
-    def tanh(x : np.ndarray):
-        return np.tanh(x)
-    def sigmoid(x: np.ndarray):
-        return 1 / (1 + np.exp(-x))
-    def softmax(x: np.ndarray):
-        x = np.exp(x-np.max(x, axis=-1, keepdims=True)) # Normalization term to avoid unbalanced output
-        return x / np.sum(x, axis=-1, keepdims=True)
-
-class Derivation:
-    def relu(z: np.ndarray):        
-        return z>0
-    def tanh(x : np.ndarray):
-        return 1 - np.square(np.tanh(x))
-    def sigmoid(z: np.ndarray):
-        return np.exp(-z) / np.square(1 + np.exp(-z))
-    def softmax(z: np.ndarray):
-        s = Activation.softmax(z)
-        return s*(1-s)
-
-
 class Layer:
     def __init__(self, input_shape = None, output_shape = None, name : str ="") -> None:
         self.input_shape = input_shape
         self.output_shape = output_shape
         self.name = name
         self.kernel = None
-    
+        self.freeze = None
+
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         if len(input_data.shape) > 3: input_data = Flatten(input_shape=input_data.shape, end_dim=-1)(input_data)
         return input_data
@@ -524,6 +551,9 @@ class Layer:
     
     def get_params_count(self):
         return 0
+    
+    def get_output(self):
+        return None
     
     def backward(self, dLoss_per_output : np.ndarray):
         return dLoss_per_output, None
@@ -597,6 +627,9 @@ class BatchNormalization(Layer):
         self.running_esperance, self.running_variance = 0, 0
         self.batch_size, self.batch_step = 0, 0
     
+    def get_output(self):
+        return self.z
+    
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         if training: 
             self.x = np.copy(input_data)
@@ -614,7 +647,7 @@ class BatchNormalization(Layer):
         self.z = self.x_hat * self.kernel + self.biases
         return self.z
     
-    def backward(self, dLoss_per_output) -> tuple[np.ndarray]:        
+    def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
         dLoss_per_x_hat = dLoss_per_output * self.kernel
         
         dLoss_per_variance = (dLoss_per_x_hat * (self.x - self.curr_esperance) * \
@@ -630,11 +663,17 @@ class BatchNormalization(Layer):
                 
         dLoss_per_gamma = np.sum(dLoss_per_output * self.x_hat, axis=0)
         dLoss_per_beta = np.sum(dLoss_per_output, axis=0)       
-        return dLoss_per_x, (dLoss_per_gamma, dLoss_per_beta)
+        return dLoss_per_x, [dLoss_per_gamma, dLoss_per_beta]
     
-    def update_params(self, dGamma: np.ndarray, dBeta: np.ndarray):
+    def update_params(self, gradient : np.ndarray):
+        dGamma, dBeta = gradient
         self.kernel += dGamma
         if self.biases is not None: self.biases += dBeta
+    
+    def get_params_count(self):
+        num_params = np.prod(self.kernel.shape) 
+        if self.biases is not None: num_params += self.biases.shape[0]
+        return num_params
 '''
 # Test Batch Norm
 a=BatchNormalization(3)
@@ -652,31 +691,44 @@ class Dense(Layer):
     # -------------------------------------------------------------------#
     # Fully connected layer
     # -------------------------------------------------------------------#
-    def __init__(self, in_features, out_features, activation = "reLu", bias=True, classes : list = None) -> None:
+    def __init__(self, in_features, out_features, activation : str | Activation = "reLu", 
+                 bias=True, classes : list = None, **kwargs) -> None:
         # Input should be like (*, in_features) and output (*, out_features)
         super().__init__()
-        assert not(activation == "softmax" and out_features < 2)
-        assert not(activation == "softmax" and classes == None)
+        if not isinstance(activation, Activation):
+            if activation in Activation._member_map_: activation = Activation._member_map_[activation]
+            else: activation = Activation.relu
+        assert not(activation == Activation.softmax and out_features < 2)
+        assert not(activation == Activation.softmax and classes == None)
         self.activation = activation
         self.classes = classes
         normalization_term = 1
-        if activation == "reLu":
+        if activation == Activation.relu:
             normalization_term = np.sqrt(2/in_features)
-        if activation == "tanh":
+        if activation == Activation.tanh or activation == Activation.sigmoid:
             normalization_term = np.sqrt(1/in_features)
         else:
-            normalization_term = np.sqrt(1 / (in_features+out_features))  
+            normalization_term = np.sqrt(2 / (in_features+out_features))  
         self.kernel = np.random.randn(in_features, out_features)*normalization_term
         self.biases = np.random.randn(out_features) if bias else None
+        if kwargs:
+            if 'load_weights' in kwargs:
+                self.kernel, self.biases = kwargs['load_weights']
+            if 'freeze' in kwargs:
+                self.freeze = kwargs['freeze']
         self.z = None
         self.x = None
+    
+    def get_output(self):
+        return self.activate(self.z)
     
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         self.x = np.copy(input_data)
         input_data = super().__call__(input_data)       
         self.z = np.dot(input_data, self.kernel) 
         if self.biases is not None: self.z += self.biases
-        return self.activate(self.z)
+        self.z = self.activate(self.z)
+        return self.z
     
     def get_params_count(self):
         num_params = np.prod(self.kernel.shape) 
@@ -687,63 +739,348 @@ class Dense(Layer):
         return self.classes
     
     def activate(self, z: np.ndarray) -> np.ndarray:
-        # Output shape : z.shape
-        match self.activation:
-            case "identity":
-                a = z 
-            case "reLu":
-                a = Activation.relu(z)
-            case "sigmoid": 
-                a = Activation.sigmoid(z)
-            case "softmax":
-                a = Activation.softmax(z)
-        return a
+        activation_function = globals()[self.activation.name]
+        return activation_function(z)
         
     def derivate(self, z: np.ndarray) -> np.ndarray:
-        # Output shape : z.shape
-        match self.activation:
-            case "identity":
-                dOut_per_z = np.ones(z.shape)
-            case "reLu":
-                dOut_per_z = Derivation.relu(z)
-            case "sigmoid":
-                dOut_per_z = Derivation.sigmoid(z)
-            case "softmax":
-                dOut_per_z = Derivation.softmax(z)
-        # print("derivate ", dOut_per_z)
-        assert dOut_per_z.shape == z.shape
-        # print("Layer: ", dOut_per_z)
-        return dOut_per_z
+        derivation_function = globals()["d"+self.activation.name]
+        return derivation_function(z)
 
     def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
         dOut_per_z = self.derivate(self.z) # shape: z.shape
         dLoss_per_z = dLoss_per_output * dOut_per_z # shape: z.shape
         dLoss_per_W = np.dot(self.x.T, dLoss_per_z) # shape: W.shape
-        dLoss_per_b = np.sum(dLoss_per_z, axis=0, keepdims=True) # shape: b.shape
+        dLoss_per_b = np.sum(dLoss_per_z, axis=0) # shape: b.shape
         dLoss_per_output = np.dot(dLoss_per_output * dOut_per_z, self.kernel.T) # shape: x.shape
-        return dLoss_per_output, (dLoss_per_W, dLoss_per_b)
+        return dLoss_per_output, [dLoss_per_W, dLoss_per_b]
         
-    def update_params(self, dW: np.ndarray, db: np.ndarray, **kwargs):
+    def update_params(self, gradient : np.ndarray, **kwargs):
+        dW, db = gradient
         if kwargs:
             if 'clip_value' in kwargs: 
                 dW = np.clip(dW, a_min=-kwargs['clip_value'], a_max=kwargs['clip_value'])            
                 db = np.clip(db, a_min=-kwargs['clip_value'], a_max=kwargs['clip_value'])
-        self.kernel += dW
-        if self.biases is not None: self.biases += db.reshape(self.biases.shape)
+        if not self.freeze:
+            self.kernel -= dW
+            if self.biases is not None: self.biases -= db.reshape(self.biases.shape)
     
     def scale_kernel(self, factor: float):
         self.kernel *= factor
 '''
 #Test Dense
-a = Dense(input_shape=(1,2,3), out_features=2, activation="softmax")
-b =a.process(np.random.randn(1,2, 3))
+a = Dense(in_features=3, out_features=2, activation="sigmoid")
+b = a(np.random.randn(2, 3))
+c = a.derivate(b)
 print(b.shape, b)
+print(c.shape, c)
 '''
 
-class NeuralNet:
+class Embedding(Layer):
+    def __init__(self, input_dim : int, output_dim : int, seq_length : int, **kwargs) -> None:
+        super().__init__()
+        self.seq_length = seq_length
+        self.kernel = np.random.uniform(low=-0.05, high=0.05, size=(input_dim, output_dim))
+        if kwargs:
+            if 'load_weights' in kwargs:
+                self.kernel = kwargs['load_weights']
+            if 'freeze' in kwargs:
+                self.freeze = kwargs['freeze']
+        self.x = None
+        self.z = None
+
+    def get_output(self):
+        return self.z
+    
+    def __call__(self, input_data: np.ndarray[int], training : bool = True) -> np.ndarray:
+        # input_data should be of shape (batch_size, sequence_length)
+        self.x = input_data
+        self.z = self.kernel[input_data]
+        return self.z
+    
+    def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
+        # dLoss_per_output of shape (batch_size, sequence_length, out_dim)
+        dLoss_per_W = np.zeros_like(self.kernel)
+        # Accumulate gradients for each word index 
+        np.add.at(dLoss_per_W, self.x, dLoss_per_output)
+        dLoss_per_output = dLoss_per_output.sum(axis=-1)
+        return None, [dLoss_per_W]
+    
+    def update_params(self, gradient: np.ndarray):
+        # print("Gradient embedding : ", sum([np.sum(g) for g in gradient]))
+        if not self.freeze:
+            self.kernel += gradient[0]
+        
+    def get_params_count(self):
+        return np.prod(self.kernel.shape) 
+
+class RNN(Layer):
+    def __init__(self, in_features : int, hidden_features : int, architecture : str | RnnArchitecture = "many_to_one", 
+                 activation : str | Activation= "tanh", **kwargs) -> None:
+        super().__init__()
+        if not isinstance(activation, Activation):
+            if activation in Activation._member_map_: activation = Activation._member_map_[activation]
+            else: activation = Activation.tanh
+        self.activation = activation
+        if not isinstance(architecture, RnnArchitecture):
+            if architecture in RnnArchitecture._member_map_: architecture = RnnArchitecture._member_map_[architecture]
+            else: architecture = RnnArchitecture.many_to_one
+        self.n_i, self.n_a, self.T_x = in_features, hidden_features, 0
+        self.architecture = architecture
+        self.x = None # shape (m, Tx, nx)
+        self.a = None # shape (m, Tx, na)
+        self.Waa = orthogonal_initializer(shape=(hidden_features, hidden_features)) # shape (na, na)
+        self.Wxa = glorot_normal_initializer(shape=(in_features, hidden_features)) # shape (nx, na)
+        self.ba = np.zeros((hidden_features, )) # shape (na, )
+        if kwargs:
+            if 'load_weights' in kwargs:
+                self.Wxa, self.Waa, self.ba = kwargs['load_weights']
+            if 'freeze' in kwargs:
+                self.freeze = kwargs['freeze']
+    
+    def get_params_count(self):
+        num_params = np.prod(self.Waa.shape) + np.prod(self.Wxa.shape) + len(self.ba)
+        return num_params
+    
+    def get_output(self):
+        return self.a
+    
+    def forward_cell(self, input_data_t: np.ndarray, a_prev : np.ndarray) -> np.ndarray:
+        # input_data shape : (m, nx) - a_prev shape : (m, na)
+        za_t = np.dot(input_data_t, self.Wxa) + np.dot(a_prev, self.Waa) + self.ba
+        activation_function = globals()[self.activation.name]       
+        a_next = activation_function(za_t)
+        return a_next
+
+    def backward_cell(self, dLoss_per_a_next : np.ndarray, t : int) -> tuple[np.ndarray]:
+        derivation_function = globals()["d"+self.activation.name]
+        dLoss_per_za_next = dLoss_per_a_next * derivation_function(self.a[:, t])
+        dLoss_per_ba = np.sum(dLoss_per_za_next, axis=0)
+        dLoss_per_Wxa = np.dot(self.x[:, t].T, dLoss_per_za_next)
+        dLoss_per_x_t = np.dot(dLoss_per_za_next, self.Wxa.T)
+        dLoss_per_a_prev = np.dot(dLoss_per_za_next, self.Waa.T)
+        dLoss_per_Waa = np.dot(self.a[:, t-1].T, dLoss_per_za_next)
+        self.time_cache['dWaa'] += dLoss_per_Waa
+        self.time_cache['dWxa'] += dLoss_per_Wxa
+        self.time_cache['dba'] += dLoss_per_ba
+        return dLoss_per_a_prev, dLoss_per_x_t
+    
+    def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
+        # Input should be like (batch_size, seq, in_features)
+        m, self.T_x, nx = input_data.shape
+        self.x = input_data
+        self.a = np.zeros(shape=(m, self.T_x, self.ba.shape[0]))
+        a_prev = np.zeros((m, self.ba.shape[0]))       
+        for t in range(self.T_x):
+            x_t = input_data[:, t]
+            a_prev = self.forward_cell(x_t, a_prev)
+            self.a[:, t] = a_prev
+        
+        if self.architecture == RnnArchitecture.many_to_many:
+            return self.a
+        if self.architecture == RnnArchitecture.many_to_one:
+            return a_prev
+    
+    def backward(self, dLoss_per_a : np.ndarray):
+        # dLoss_per_a shape : (m, Tx, na)
+        self.time_cache = {'dWaa': 0, 'dWxa': 0, 'dba': 0}
+        dLoss_per_x = np.zeros_like(self.x)
+        dLoss_per_a_prev = dLoss_per_a
+        for t in reversed(range(self.T_x)):
+            if self.architecture == RnnArchitecture.many_to_many:
+                dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a[:, t], t)
+            elif self.architecture == RnnArchitecture.many_to_one:
+                dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a_prev, t)
+            dLoss_per_x[:, t] = dLoss_per_x_t
+        cumul_gradients = [gradient for gradient in self.time_cache.values()]
+        return dLoss_per_x, cumul_gradients
+    
+    def update_params(self, gradient : np.ndarray):
+        # print("Gradient RNN : ", sum([np.sum(g) for g in gradient]))
+        if not self.freeze:
+            self.Waa += gradient[0]
+            self.Wxa += gradient[1]
+            self.ba += gradient[2]
+        return
+
+'''
+# Test Reccurent Layer
+in_features=5
+hidden_features=3
+batch = 10
+T = 5
+a = RNN(in_features, hidden_features)
+input = np.random.randn(batch, T, in_features)
+y = a(input)
+print(y.shape)
+'''
+
+class LSTM(Layer):
+    def __init__(self, in_features : int, hidden_features : int, architecture : str | RnnArchitecture = "many_to_one", 
+                 activation : str | Activation= "tanh") -> None:
+        # Input should be like (in_features, batch_size)
+        super().__init__()
+        if not isinstance(activation, Activation):
+            if activation in Activation._member_map_: activation = Activation._member_map_[activation]
+            else: activation = Activation.tanh
+        self.activation = activation
+        if not isinstance(architecture, RnnArchitecture):
+            if architecture in RnnArchitecture._member_map_: architecture = RnnArchitecture._member_map_[architecture]
+            else: architecture = RnnArchitecture.many_to_one
+        self.architecture = architecture
+        
+        self.n_i, self.n_a, self.T_x = in_features, hidden_features, 0
+        # Gates and cells info
+        self.Wf = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # forget gate weights
+        self.bf = np.zeros(shape=(hidden_features,)) # forget gate bias
+        self.ft = None # forget gate shape (m, Tx, na)
+        
+        self.Wu = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # update gate weights
+        self.bu = np.zeros(shape=(hidden_features,)) # update gate bias
+        self.ut = None # update gate shape (m, Tx, na)
+        
+        self.Wo = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # output gate weights
+        self.bo = np.zeros(shape=(hidden_features,)) # output gate bias
+        self.ot = None # output gate shape (m, Tx, na)
+        
+        self.Wc = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # candidate state weights
+        self.bc = np.zeros(shape=(hidden_features,)) # candidate state bias
+        
+        self.x = None # shape (m, Tx, nx)
+        self.c = None # cell state shape (m, Tx, na)
+        self.candidate = None # candidate cell state shape (m, Tx, na)
+        self.a = None # hidden state shape (m, Tx, na)
+        
+        self.time_cache = {'dWf': [], 'dWu': [], 'dWo': [], 'dWc' : [], 'bf' : [], 'bu': [], 'bo': [], 'bc': []}
+    
+    def get_params_count(self):
+        num_params = np.prod(self.Wf.shape) + np.prod(self.Wu.shape) + np.prod(self.Wo.shape) + np.prod(self.Wc.shape) + \
+            len(self.bf) + len(self.bu) + len(self.bo) + len(self.bc)
+        return num_params
+
+    def get_output(self):
+        return self.a
+    
+    def forward_cell(self, input_data_t: np.ndarray, a_prev : np.ndarray, c_prev : np.ndarray) -> np.ndarray:
+        # input_data shape : (m, nx) - a_prev shape : (m, na) - c_prev shape : (m, na)
+        # print("Shapes", input_data_t.shape, a_prev.shape)
+        concat = np.concatenate((a_prev, input_data_t), axis=-1)
+        ft = sigmoid(np.dot(concat, self.Wf) + self.bf)
+        ut = sigmoid(np.dot(concat, self.Wu) + self.bu)
+        candidate = tanh(np.dot(concat, self.Wc) + self.bc)
+        c_next = ft * c_prev + ut * candidate
+        ot = sigmoid(np.dot(concat, self.Wo) + self.bo)
+        activation_function = globals()[self.activation.name]       
+        a_next = ot * activation_function(c_next) 
+        return a_next, c_next, candidate, ft, ut, ot
+    
+    def backward_cell(self, dLoss_per_a_t : np.ndarray, dLoss_per_c_t : np.ndarray, t : int) -> tuple[np.ndarray]:
+        xt = self.x[:, t]
+        concat = np.concatenate((self.a[:, t], xt), axis=-1)
+        
+        activation_function = globals()[self.activation.name]
+        derivation_function = globals()["d"+self.activation.name]
+        dLoss_per_c_t += dLoss_per_a_t * self.ot[:, t] * derivation_function(activation_function(self.c[:, t]))
+        
+        dLoss_per_ot = dLoss_per_a_t * activation_function(self.c[:, t])  * dsigmoid(self.ot[:, t])
+        
+        dLoss_per_candidate = dtanh(self.candidate[:, t]) * (dLoss_per_c_t * self.ut[:, t] \
+            + self.ot[:, t] * derivation_function(self.c[:, t]) * self.ut[:, t] * dLoss_per_a_t)
+        
+        dLoss_per_ut = dsigmoid(self.ut[:, t]) * (dLoss_per_c_t * self.candidate[:, t] \
+            + self.ot[:, t] * derivation_function(self.c[:, t]) * self.candidate[:, t] * dLoss_per_a_t)
+        
+        dLoss_per_ft = dsigmoid(self.ft[:, t]) * (dLoss_per_c_t * self.c[:, t-1] \
+            + self.ot[:, t] * derivation_function(self.c[:, t]) * self.c[:, t-1] * dLoss_per_a_t)
+            
+        dLoss_per_Wo = np.dot(concat.T, dLoss_per_ot)
+        dLoss_per_Wu = np.dot(concat.T, dLoss_per_ut)
+        dLoss_per_Wf = np.dot(concat.T, dLoss_per_ft)
+        dLoss_per_Wc = np.dot(concat.T, dLoss_per_candidate)
+        
+        dLoss_per_bo = np.sum(dLoss_per_ot, axis=0)
+        dLoss_per_bu = np.sum(dLoss_per_ut, axis=0)
+        dLoss_per_bf = np.sum(dLoss_per_ft, axis=0)
+        dLoss_per_bc = np.sum(dLoss_per_candidate, axis=0)
+            
+        self.time_cache['dWf'].append(dLoss_per_Wf)
+        self.time_cache['dWu'].append(dLoss_per_Wu)
+        self.time_cache['dWo'].append(dLoss_per_Wo)
+        self.time_cache['dWc'].append(dLoss_per_Wc)
+        self.time_cache['dbf'].append(dLoss_per_bf)
+        self.time_cache['dbu'].append(dLoss_per_bu)
+        self.time_cache['dbo'].append(dLoss_per_bo)
+        self.time_cache['dbc'].append(dLoss_per_bc)
+        
+        # Compute derivatives w.r.t previous hidden state, previous memory state and input.
+        dLoss_per_concat = np.dot(dLoss_per_ft, self.Wf.T) + np.dot(dLoss_per_ot, self.Wo.T) + \
+            np.dot(dLoss_per_ut, self.Wu.T) + np.dot(dLoss_per_candidate, self.Wc.T)
+        dLoss_per_x_t = dLoss_per_concat[:, : self.n_i]
+        dLoss_per_a_prev = dLoss_per_concat[:, self.n_i:]
+        dLoss_per_c_prev = dLoss_per_c_t * self.ft[:, t] \
+            + self.ot[:, t] *  derivation_function(self.c[:, t]) * self.ft[:, t] * dLoss_per_a_t
+        
+        return dLoss_per_x_t, dLoss_per_a_prev, dLoss_per_c_prev
+    
+    def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
+        # Input should be like (batch_size, seq, in_features)
+        m, self.T_x, nx = input_data.shape
+        na = self.bf.shape[0]
+        self.x = input_data
+        self.a = np.random.randn(m, self.T_x, na)
+        self.c = np.random.randn(m, self.T_x, na) # np.zeros(shape=(m, Tx, na))
+        self.ft = np.zeros(shape=(m, self.T_x, na))
+        self.ut = np.zeros(shape=(m, self.T_x, na))
+        self.ot = np.zeros(shape=(m, self.T_x, na))
+        self.candidate = np.zeros(shape=(m, self.T_x, na))
+        
+        a_prev = np.zeros(shape=(m, na))
+        c_prev = np.zeros(shape=(m, na))
+
+        for t in range(self.T_x):
+            x_t = input_data[:, t]
+            a_prev, c_prev, candidate, ft, ut, ot = self.forward_cell(x_t, a_prev, c_prev)
+            self.a[:, t] = a_prev
+            self.c[:, t] = c_prev
+            self.candidate[:, t] = candidate
+            self.ft[:, t] = ft
+            self.ut[:, t] = ut
+            self.ot[:, t]= ot
+        
+        if self.architecture == RnnArchitecture.many_to_many:
+            return self.a
+        if self.architecture == RnnArchitecture.many_to_one:
+            return a_prev
+
+    def backward(self, dLoss_per_a : np.ndarray):
+        # dLoss_per_a shape : (m, na)
+        self.time_cache = {'dWf': [], 'dWu': [], 'dWo': [], 'dWc' : [], 'dbf' : [], 'dbu': [], 'dbo': [], 'dbc': []}
+        dLoss_per_x = np.zeros_like(self.x)
+        dLoss_per_a_prev = dLoss_per_a
+        dLoss_per_c_prev = np.zeros_like(dLoss_per_a_prev)
+        for t in reversed(range(self.T_x)):
+            if self.architecture == RnnArchitecture.many_to_many:
+                dLoss_per_x_t, dLoss_per_a_prev = self.backward_cell(dLoss_per_a[:, t], t)
+            elif self.architecture == RnnArchitecture.many_to_one:
+                dLoss_per_x_t, dLoss_per_a_prev, dLoss_per_c_prev = self.backward_cell(dLoss_per_a_prev, dLoss_per_c_prev, t)
+            dLoss_per_x[:, t] = dLoss_per_x_t
+        cumul_gradients = [np.sum(self.time_cache[gradient], axis=0) for gradient in self.time_cache.keys()]
+        return dLoss_per_x, cumul_gradients
+    
+    def update_params(self, gradient : np.ndarray):
+        self.Wf += gradient[0]
+        self.Wu += gradient[1]
+        self.Wo += gradient[2]
+        self.Wc += gradient[3]
+        self.bf += gradient[4]
+        self.bu += gradient[5]
+        self.bo += gradient[6]
+        self.bc += gradient[7]
+        return
+    
+    
+class Sequential:
     def __init__(self, usage:Usage = Usage.regression) -> None:
-        #self.input_shape = input_shape
-        self.layers_stack : list[Layer] = []
+        self.layers : list[Layer] = []
         self.cache : list[dict[str, np.ndarray]] = [] # prediction - train_loss - val_loss - dL/dOut - gradients
         self.layers_counter : dict[str, any] = {} # layers counters for each type
         self.loss_fn : Loss = None
@@ -754,7 +1091,7 @@ class NeuralNet:
         self.batch_size = None
         self.usage = usage
         self.training_steps_tracker = 0
-    
+
     def add_layer(self, layer: Layer):
         layer_class = type(layer).__name__
         if not layer_class in self.layers_counter: 
@@ -763,14 +1100,14 @@ class NeuralNet:
         else: 
             layer.rename(layer_class.lower() + '_' + str(self.layers_counter[layer_class]))
             self.layers_counter[layer_class] += 1
-        self.layers_stack.append(layer)
+        self.layers.append(layer)
     
     def pop_cache(self) -> dict[str, any]:
         return self.cache.pop()
     
     def init_cache(self) -> None:        
         self.cache.clear()
-        zeros = [(0, 0) for l in self.layers_stack]        
+        zeros = [(0, 0) for l in self.layers]        
         self.cache.append({'prediction': None, 'train_loss': None, 'val_loss': None, 
                            'dL/dOut': None, 'gradients': zeros})
         return
@@ -792,49 +1129,22 @@ class NeuralNet:
         self.optimizer.lr.set_decays_step(num_epochs*steps_per_epoch)
         return
     
-    def forward(self, input_data: np.ndarray) -> np.ndarray:
-        output = input_data
-        for layer in self.layers_stack:
-            output = layer(output, self.training)
-        if self.training: self.cache.append({'prediction': output})
-        return output
-
-    def compute_loss(self, y_recorded: np.ndarray) -> float:
-        loss, dLoss_per_output = self.loss_fn(self.cache[-1]['prediction'], y_recorded)        
-        if self.training:
-            if self.regularizer: loss += self.regularizer.loss_reg(self.trainable_params())
-            self.cache[-1]['train_loss'] = loss
-            self.cache[-1]['dL/dOut'] = dLoss_per_output
-        else: self.cache[-1]['val_loss'] = loss
-        return loss
-    
-    def backpropagate(self):
-        # -------------------------------------------------------------------#
-        # Backpropagate the prediction error into all layers
-        # -------------------------------------------------------------------#
-        self.cache[-1]['gradients'] = []
-        dLoss_per_output = self.cache[-1]['dL/dOut']
-        for layer in reversed(self.layers_stack):
-            dLoss_per_output, dLoss_per_params = layer.backward(dLoss_per_output)                
-            self.cache[-1]['gradients'].append(dLoss_per_params)
-        for l_index, layer in enumerate(reversed(self.layers_stack)):
-            if self.cache[-1]['gradients'][l_index] is not None:
-                # Optimization and regularization            
-                if self.regularizer: 
-                    self.cache[-1]['gradients'][l_index][0] += self.regularizer.gradients_reg(layer.kernel)
-                if self.optimizer:
-                    self.cache[-1]['gradients'][l_index] = self.optimizer(self.cache, l_index, step=self.training_steps_tracker) 
-                gradient_W, gradient_biases = self.cache[-1]['gradients'][l_index]
-                # Normalization
-                gradient_W, gradient_biases = gradient_W/len(layer.z), gradient_biases/len(layer.z)
-                self.cache[-1]['gradients'][l_index] = gradient_W, gradient_biases
-                layer.update_params(-gradient_W, -gradient_biases)
-                
     def disable_dropout(self, p: float):
         if not p: return
-        for layer in self.layers_stack:
-            if layer != self.layers_stack[-1]: layer.scale_kernel(p)
-               
+        for layer in self.layers:
+            if layer != self.layers[-1]: layer.scale_kernel(p)
+
+    def compile(self, learning_rate : float | LearningRateScheduler = 0.01, loss_fn: str | Loss = "l2", 
+                regularizer: Regularizer=None, dropout: float = None, optimizer: Optimizer=None):        
+        self.loss_fn = Loss(loss_fn) if type(loss_fn) != Loss else loss_fn
+        self.optimizer = (optimizer if optimizer else Optimizer(learning_rate))
+        self.init_cache()
+        self.regularizer = regularizer        
+        self.dropout = dropout
+        if dropout and (n_layers := len(self.layers)) > 1:            
+            [self.layers.insert(i, Dropout(dropout)) for i in range(1, n_layers+1, 2)]
+        return
+    
     def SGD(self, X: np.ndarray, Y: np.ndarray, validation_data : tuple[np.ndarray]):
         # Stochastic Gradient Descent
         self.training = True
@@ -849,7 +1159,7 @@ class NeuralNet:
                 eval_metrics.update(self.evaluate(validation_data[0], validation_data[1], validation=True))
                 pepoch.set_postfix(eval_metrics) # Progress bar infos
             self.update_steps_tracker()
-            
+    
     def BGD(self, X: np.ndarray, Y: np.ndarray, validation_data : tuple[np.ndarray]):
         # Batch Gradient Descent
         self.training = True
@@ -878,17 +1188,44 @@ class NeuralNet:
                 pbatch.set_postfix(eval_metrics) # Progress bar infos
             self.update_steps_tracker()
             
-    def compile(self, learning_rate : float | LearningRateScheduler = 0.01, loss_fn: str | Loss = "l2", regularizer: Regularizer=None, 
-                        dropout: float = None, optimizer: Optimizer=None):        
-        self.loss_fn = Loss(loss_fn) if type(loss_fn) != Loss else loss_fn
-        self.optimizer = (optimizer if optimizer else Optimizer(learning_rate))
-        self.init_cache()
-        self.regularizer = regularizer        
-        self.dropout = dropout
-        if dropout and (n_layers := len(self.layers_stack)) > 1:            
-            [self.layers_stack.insert(i, Dropout(dropout)) for i in range(1, n_layers+1, 2)]
-        return
+    def forward(self, input_data: np.ndarray) -> np.ndarray:
+        output = input_data
+        for layer in self.layers:
+            output = layer(output, self.training)
+        if self.training: self.cache.append({'prediction': output})
+        return output
     
+    def compute_loss(self, y_recorded: np.ndarray) -> float:
+        loss, dLoss_per_output = self.loss_fn(self.cache[-1]['prediction'], y_recorded)        
+        if self.training:
+            if self.regularizer: loss += self.regularizer.loss_reg(self.trainable_params())
+            self.cache[-1]['train_loss'] = loss
+            self.cache[-1]['dL/dOut'] = dLoss_per_output
+        else: self.cache[-1]['val_loss'] = loss
+        return loss
+    
+    def backpropagate(self):
+        # -------------------------------------------------------------------#
+        # Backpropagate the prediction error into all layers
+        # -------------------------------------------------------------------#
+        self.cache[-1]['gradients'] = []
+        dLoss_per_output = self.cache[-1]['dL/dOut']
+        
+        for l_index, layer in enumerate(reversed(self.layers)):
+            dLoss_per_output, dLoss_per_params = layer.backward(dLoss_per_output)
+            self.cache[-1]['gradients'].insert(0, dLoss_per_params)
+        
+        for l_index, layer in enumerate(self.layers):
+            gradients = self.cache[-1]['gradients'][l_index]
+            if gradients is not None:
+                # Optimization and regularization            
+                # if self.regularizer:
+                #    self.cache[-1]['gradients'][l_index][0] += self.regularizer.gradients_reg(layer.kernel) # Attention
+                if self.optimizer:
+                    gradients = self.optimizer(gradients, l_index, step=self.training_steps_tracker, epoch=len(self.cache)) 
+                layer.update_params(gradients)
+                self.cache[-1]['gradients'][l_index] = gradients
+                    
     def train_one_epoch(self, train_X: np.ndarray, train_Y: np.ndarray, validation_data : tuple[np.ndarray],
                     batch_size: int=None):
         X, Y = train_X, train_Y
@@ -949,9 +1286,9 @@ class NeuralNet:
             eval_metrics['test_loss'] = loss
             if self.usage != Usage.regression: 
                 eval_metrics['accuracy'] = Accuracy(Y_hat, Y, usage=self.usage, verbose=True).output
-            if self.usage == Usage.multiClassification:                 
-                eval_metrics['conf_mat'] = (ConfusionMatrix(Y_hat, Y, self.layers_stack[-1].get_classes(), 
-                    usage=self.usage, verbose=True)).output
+            if self.usage == Usage.multiClassification or self.usage == Usage.logisticRegression:                 
+                classes = self.layers[-1].get_classes() if self.usage == Usage.multiClassification else [0, 1]
+                eval_metrics['conf_mat'] = (ConfusionMatrix(Y_hat, Y, classes, usage=self.usage, verbose=True)).output
         return eval_metrics
     
     def cross_validate(self, k : int, train_X: np.ndarray, train_Y: np.ndarray, 
@@ -992,10 +1329,10 @@ class NeuralNet:
                 else: Y_hat = np.vstack([Y_hat, y_hat])
         if self.dropout: self.disable_dropout(1/self.dropout)    
         return Y_hat
-        
+       
     def trainable_params(self) -> np.ndarray:
         params = []
-        for layer in self.layers_stack:
+        for layer in self.layers:
             params.append(layer.kernel)
         params = np.array(params, dtype=object)
         return params
@@ -1007,80 +1344,20 @@ class NeuralNet:
         print("________________________________________________________\n")
         print("Layer (type)\t\t\t Params #")
         print("========================================================\n")
-        for layer in self.layers_stack:
+        for layer in self.layers:
             print(layer.name + " (" + type(layer).__name__ + ")" + "\t\t\t", end='')
             print(str(layer.get_params_count())+"\n")
             total += layer.get_params_count()
         print("========================================================\n")
         print("Total params: " + str(total) + "\n\n")
         
-    def draw(self):
-        fig, ax = plt.subplots()
-        y = 0
-        r = 0.5
-        offset = 4
-        x = r
-        visual_nodes = [0]*self.total_nodes
-        beautiful_colors = [(0.25,0.88,0.82),
-                            (0.8,0.6,1),
-                            (1,0.7,0.5),
-                            (1,0.85,0.35),
-                            (0.53,0.81,0.92),
-                            (0.58,0.44,0.86),
-                            (0.5,0.5,0),
-                            (0.99,0.81,0.87)]
-
-        for i in range(len(self.layers_stack)):
-            # Draw the layer nodes
-            layer = self.layers_stack[i]
-            y = r
-            #color = random.choice(beautiful_colors)
-            color=(random.random(), random.random(),
-                   random.random())
-            bias = layer.nodes[-1]
-            for node in layer.nodes:
-                # Draw circles (nodes)                
-                tmp = visual_nodes[node['id']] = Circle((x, y), r, fill=False, color=color )                
-                ax.add_artist(tmp)
-                ax.text(x=tmp.center[0], y=tmp.center[1], s=node['id'] if node != bias or i == len(self.layers_stack)-1 
-                        else f"{node['id']} (bias)", color=color)
-                y += r+1
-            
-            x += offset
-
-        # Draw forward arrows
-        for layer in self.layers_stack[:-1]:
-            for node in layer.nodes:
-                for connected_node in node['output_nodes']:
-                    A = visual_nodes[node['id']].center[0]+r, visual_nodes[node['id']].center[1]
-                    B = visual_nodes[connected_node['id']].center[0]-r, visual_nodes[connected_node['id']].center[1]
-
-                    opposed_side_length = A[1] - B[1]
-                    hypotenuse_length = math.sqrt((A[0]-B[0])**2 + (A[1]-B[1])**2)
-                    assert hypotenuse_length >= 0
-                    epsilon = 1e-10
-                    hypotenuse_length = max(hypotenuse_length, epsilon)
-
-                    angle = math.degrees(math.asin(opposed_side_length/hypotenuse_length))
-                    ax.add_artist(ConnectionPatch(A, B, "data", "data", arrowstyle='->', color='blue'))
-                    label= self.get_weight_value(self.get_weight(f"w{node['id']}{connected_node['id']}")) 
-                    ax.text(x = (A[0]+B[0])/2, y=(A[1]+B[1])/2, 
-                            s=f"{label:.2f} ", rotation=-angle, 
-                            rotation_mode='anchor', ha='center', va="center")
-                            
-        ax.set_xlim(0, 10)
-        ax.set_ylim(0, 10)
-        plt.title("Model")
-        fig.tight_layout()
-        plt.show()
-        pass
-
     def save(self, model_name):
         # Save the model in the working directory
         with open(f"{model_name}.ssj","wb") as save_file:
             pickle.dump(self, save_file)
         
     def display_losses(self, *args, **kwargs):
+        return
         if not args and not kwargs:
             train_losses = self.get_cache('train_loss')
             val_losses = self.get_cache('val_loss')           
@@ -1103,210 +1380,7 @@ class NeuralNet:
     
     def show_lr_evolution(self):
         self.optimizer.show_lr_evolution()
-
-
-class Recurrent(Layer):
-    def __init__(self, in_features : int, hidden_features : int, out_features : int, activation : str = "tanh") -> None:
-        # Input should be like (in_features, batch_size)
-        super().__init__()
-        self.activation = activation
-        self.x = None # shape (nx, m, T_x)
-        self.a = None # shape (na, m, T_x)
-        self.zy = None # shape (ny, m, T_y)
-        self.Waa = np.random.randn(hidden_features, hidden_features)*np.sqrt(1/hidden_features) # shape (na, na)
-        self.Wax = np.random.randn(hidden_features, in_features)*np.sqrt(1/hidden_features) # shape (na, nx)
-        self.Wy =  np.random.randn(out_features, hidden_features)*np.sqrt(1/out_features)# shape (ny, na)
-        self.ba = np.random.randn(hidden_features, 1) # shape (na, )
-        self.by = np.random.randn(out_features, 1) # shape (ny, )
-        self.cache = [{'a': None, 'y' : None}] # hidden states and predictions
-        self.time_cache = [{'dWy': None, 'dby': None, 'dWaa': None, 'dWax': None, 'dba': None}]
-        
-    def forward_cell(self, input_data: np.ndarray, a_prev : np.ndarray, training : bool = True) -> np.ndarray:
-        za_t = np.dot(self.Wax, input_data) + np.dot(self.Waa, a_prev) + self.ba 
-        if self.activation == "tanh": a_next = Activation.tanh(za_t)
-        elif self.activation == "reLu": a_next = Activation.relu(za_t)        
-        zy_t = np.dot(self.Wy, a_next) + self.by        
-        return a_next, zy_t
-
-    def backward_cell(self, dLoss_per_output : np.ndarray, t : int) -> tuple[np.ndarray]:
-        # First step compute gradients for output parameters
-        dLoss_per_zy_t = dLoss_per_output * Derivation.softmax(self.zy[:, :, t])
-        dLoss_per_by = np.sum(dLoss_per_zy_t, axis=0, keepdims=True)
-        dLoss_per_Wy = np.dot(dLoss_per_output, self.a[:, :, t].T)
-        dLoss_per_a_t = np.dot(self.Wy.T, dLoss_per_output)        
-        # Now compute gradients for hidden state parameters
-        dLoss_per_za_t = dLoss_per_a_t * (1 - np.square(self.a[:, :, t]))
-        dLoss_per_ba = np.sum(dLoss_per_za_t, axis=0, keepdims=True)
-        dLoss_per_Wax = np.dot(dLoss_per_za_t, self.x[:, :, t].T)
-        
-        if t >= 0 :
-            dLoss_per_Waa = np.dot(dLoss_per_za_t, self.a[:, :, t-1].T)
-            dLoss_per_a_prev = np.dot(self.Waa.T, dLoss_per_za_t)
-        else: 
-            dLoss_per_Waa, dLoss_per_a_prev = 0, 0
-
-        self.time_cache.append(
-            {'dWy': dLoss_per_Wy, 'dby': dLoss_per_by, 'dWaa': dLoss_per_Waa, 'dWax': dLoss_per_Wax, 'dba': dLoss_per_ba}
-        )
-        return dLoss_per_a_prev
     
-    def forward_one_batch(self, input_data: np.ndarray) -> np.ndarray:
-        # Input should be like (in_features, batch_size, seq)
-        n_x, m, T_x = input_data.shape
-        self.x = input_data
-        self.a = np.zeros(shape=(self.ba.shape[0], m, T_x))
-        self.zy = np.zeros(shape=(self.by.shape[0], m, T_x))
-        prediction = np.zeros(shape=(self.by.shape[0], m, T_x))
-        a_prev = self.a[:, :, 0]        
-        for t in range(T_x):
-            x_t = input_data[:, :, t]
-            a_prev, zy_t = self.forward_cell(x_t, a_prev)
-            self.a[:, :, t] = a_prev
-            self.zy[:, :, t] = zy_t
-            # self.cache.append({'a' : a_prev, 'y': y_t})
-            prediction[:, :, t] = Activation.softmax(zy_t)
-        return prediction
-    
-    def backward_one_batch(self, dLoss_per_output : np.ndarray):
-        T_y = dLoss_per_output.shape[-1]
-        for t in reversed(range(T_y)):
-            print(t)
-            dLoss_per_a_prev = self.backward_cell(dLoss_per_output[:, :, t], t)
-        return
-
-# Test Reccurent Layer
-in_features=5
-hidden_features=3
-out_features=2
-batch = 10
-T = 5
-a = Recurrent(in_features, hidden_features, out_features)
-input = np.random.randn(in_features, batch, T)
-output = np.random.randn(out_features, batch, T)
-y = a.forward_one_batch(input)
-_, L = Loss()(y, output)
-a.backward_one_batch(L)
-print(a.time_cache)
-
-
-class LSTM(Layer):
-    def __init__(self, in_features : int, hidden_features : int, out_features : int, activation : str = "tanh") -> None:
-        # Input should be like (in_features, batch_size)
-        super().__init__()
-        self.activation = activation        
-        self.x_t, self.y_t = None, None
-        
-        self.Wy =  np.random.randn(out_features, hidden_features)*np.sqrt(1/out_features) # prediction weights of shape (ny, na)
-        self.by = np.random.randn(out_features, 1) # shape (ny, )
-        
-        # Gates and cells info
-        self.Wf = np.random.randn(hidden_features, in_features + hidden_features)*np.sqrt(1/hidden_features) # forget gate weights
-        self.bf = np.random.randn(hidden_features, 1) # forget gate bias
-        self.ft = None # forget gate
-        
-        self.Wu = np.random.randn(hidden_features, in_features + hidden_features)*np.sqrt(1/hidden_features) # update gate weights
-        self.bu = np.random.randn(hidden_features, 1) # update gate bias
-        self.ut = None # update gate
-        
-        self.Wo = np.random.randn(hidden_features, in_features + hidden_features)*np.sqrt(1/hidden_features) # output gate weights
-        self.bo = np.random.randn(hidden_features, 1) # output gate bias
-        self.ot = None # output gate
-        
-        self.Wc = np.random.randn(hidden_features, in_features + hidden_features)*np.sqrt(1/hidden_features) # candidate state weights
-        self.bc = np.random.randn(hidden_features, 1) # candidate state bias
-        
-        self.c_t = None # cell state
-        self.cct = None # candidate cell state
-        self.a_t = None # hidden state
-        
-        self.cache = [{'a': None, 'c': None,'y' : None}] # hidden states and predictions
-    
-    def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
-        self.x_t = np.copy(input_data)
-        input_data = super().__call__(input_data)
-        concat = np.concatenate(input_data, self.a_t)
-        
-        self.ft = Activation.sigmoid(np.dot(self.Wf, concat) + self.bf)
-        self.ut = Activation.sigmoid(np.dot(self.Wu, concat) + self.bu)
-        self.cct = Activation.tanh(np.dot(self.Wc, concat) + self.bc)
-        self.c_t = self.ft * self.c_t + self.ut * self.cct
-        self.ot = Activation.sigmoid(np.dot(self.Wo, concat) + self.bo)
-        self.a_t = self.ot * Activation.tanh(self.c_t)
-        self.y_t = Activation.softmax(np.dot(self.Wy, self.a_t) + self.by)
-        
-        self.cache.append({'a': self.a_t, 'c': self.c_t, 'y' : self.y_t})
-        return 
-    
-    def forward_one_epoch(self, input_data: np.ndarray) -> np.ndarray:
-        # Input should be like (in_features, batch_size, seq)
-        n_x, m, T_x = input_data.shape
-        if self.a_t is None : self.a_t = np.zeros(shape=(self.bc.shape[0], m))
-        if self.c_t is None : self.c_t = np.zeros(shape=(self.bc.shape[0], m))     
-        for t in range(T_x):
-            x_t = input_data[:, :, t]
-            a_prev, _ = self.__call__(x_t)
-            
-class RNN :
-    def __init__(self, in_features : int, hidden_features : int, num_layers : int = 1, activation : str = "tanh") -> None:
-        self.in_features = in_features
-        self.hidden_features = hidden_features
-        self.num_layers = num_layers
-        self.activation = activation
-        self.cells = []
-        
-        self.cache : list[dict[str, np.ndarray]] = [] # prediction - train_loss - val_loss - dL/dOut - gradients
-        self.loss_fn : Loss = None
-        self.regularizer : Regularizer = None
-        self.optimizer : Optimizer = None
-        self.dropout : float = None
-        self.training : bool = True
-        self.batch_size = None
-        # self.usage = usage
-        self.training_steps_tracker = 0
-        
-    def add_cells(self, Tx : int = 2):
-        self.cells = [Recurrent(self.in_features, self.hidden_features, self.num_layers, self.activation) for _ in range(Tx)]
-        return len(self.cells)
-    
-    def pop_cache(self) -> dict[str, any]:
-        return self.cache.pop()
-    
-    def init_cache(self) -> None:        
-        self.cache.clear()
-        self.cache.append({'prediction': None, 'train_loss': None, 'val_loss': None, 
-                           'dL/dOut': None, 'gradients': 0})
-        return
-    
-    def get_cache(self, key: str):
-        if key not in self.cache[-1]: return None
-        else: return np.array([data[key] for data in self.cache[1:]])
-
-    def update_steps_tracker(self):
-        self.training_steps_tracker += 1
-        return
-    
-    def reset_steps_tracker(self):
-        self.training_steps_tracker = 0
-    
-    def set_lr_scheduler(self, data_size : int, batch_size : int, num_epochs : int):
-        steps_per_epoch = 1 if not batch_size else math.ceil(data_size/batch_size)
-        self.optimizer.lr.set_steps_per_epoch(steps_per_epoch)
-        self.optimizer.lr.set_decays_step(num_epochs*steps_per_epoch)
-        return
-    
-    def forward(self, input_data: np.ndarray) -> np.ndarray:
-        # Input should be like (in_features, batch_size, seq)
-        n_x, m, T_x = input_data.shape
-        self.add_cells(T_x)
-        a_prev = None
-        for t in range(T_x):
-            x_t = input_data[:, :, t]
-            cell_t = self.cells[t]
-            a_prev = cell_t(x_t, a_prev)            
-        
-    
-    def compute_loss(self, y_recorded: np.ndarray) -> float:
-        return
 
 def load(model_name):
     with open(f"{model_name}.ssj","rb") as save_file:
