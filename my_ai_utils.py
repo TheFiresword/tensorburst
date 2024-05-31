@@ -8,6 +8,8 @@ from tqdm import tqdm
 from enum import Enum
 import copy
 
+# Potentiellement categorical_cross_entropy, Adagrad et Adam et l'initialisation
+
 def identity(input : np.ndarray):
     return input
 def relu(input: np.ndarray):        
@@ -23,7 +25,7 @@ def softmax(input: np.ndarray):
 def didentity(activation: np.ndarray):
     return np.ones(activation.shape)
 def drelu(activation: np.ndarray):        
-    return activation>0
+    return (activation>0).astype(np.int32)
 def dtanh(activation : np.ndarray):
     return 1 - np.square(activation)
 def dsigmoid(activation: np.ndarray):
@@ -45,9 +47,6 @@ def orthogonal_initializer(shape, gain=1.0):
     return gain * q
 
 def glorot_uniform_initializer(shape):
-    """
-    Glorot Uniform initializer.
-    """
     fan_in, fan_out = shape[0], shape[1]
     limit = np.sqrt(6 / (fan_in + fan_out))
     return np.random.uniform(-limit, limit, size=shape)
@@ -317,28 +316,28 @@ class Loss:
         match self.loss_fn:
             case "l0-1":
                 self.dLoss_per_prediction = 0
-                self.error =  np.where(y_recorded != y_predicted, 1, 0).sum(axis=tuple(range(1, y_predicted.ndim)))
+                self.error =  np.where(y_recorded != y_predicted, 1, 0).mean(axis=tuple(range(1, y_predicted.ndim)))
             case "hinge":
                 self.dLoss_per_prediction =  np.where(1-y_recorded*y_predicted >=0, -y_recorded, 0)
-                self.error = np.maximum(0, 1-y_recorded*y_predicted).sum(axis=tuple(range(1, y_predicted.ndim)))            
+                self.error = np.maximum(0, 1-y_recorded*y_predicted).mean(axis=tuple(range(1, y_predicted.ndim)))            
             case "l2" | "quadratic":
                 self.dLoss_per_prediction = 2*(y_predicted-y_recorded)
-                self.error = np.square(y_predicted-y_recorded).sum(axis=tuple(range(1, y_predicted.ndim)))
+                self.error = np.square(y_predicted-y_recorded).mean(axis=tuple(range(1, y_predicted.ndim)))
             case "l1":
                 self.dLoss_per_prediction = np.sign(y_predicted)
-                self.error = np.absolute(y_recorded-y_predicted).sum(axis=tuple(range(1, y_predicted.ndim)))
+                self.error = np.absolute(y_recorded-y_predicted).mean(axis=tuple(range(1, y_predicted.ndim)))
             case "binary_cross_entropy":
                 assert len(y_recorded.shape) >= 2 and y_recorded.shape[-1] == 1
                 # Clipping y_predicted to avoid log(0)
                 y_predicted = np.clip(y_predicted, self.epsilon, 1 - self.epsilon)
                 self.dLoss_per_prediction = (y_predicted-y_recorded) / (y_predicted * (1- y_predicted))
-                self.error = - (y_recorded * np.log(y_predicted) + (1 - y_recorded) * np.log(1 - y_predicted)).sum(axis=tuple(range(1, y_predicted.ndim)))               
+                self.error = - (y_recorded * np.log(y_predicted) + (1 - y_recorded) * np.log(1 - y_predicted)).mean(axis=tuple(range(1, y_predicted.ndim)))               
             case "categorical_cross_entropy":
                 assert len(y_recorded.shape) >= 2 and y_recorded.shape[-1] > 1
                 assert np.min(y_predicted) >= 0 and np.max(y_predicted) <= 1
                 y_predicted = np.clip(y_predicted, self.epsilon, 1 - self.epsilon)
                 self.dLoss_per_prediction = (y_predicted - y_recorded) # / y_recorded.shape[-1]
-                self.error = (-y_recorded * np.log(y_predicted)).sum(axis=tuple(range(1, y_predicted.ndim)))
+                self.error = (-y_recorded * np.log(y_predicted)).mean(axis=tuple(range(1, y_predicted.ndim)))
         self.error = np.mean(self.error)
         self.dLoss_per_prediction /= batch_size
         return self.error, self.dLoss_per_prediction
@@ -561,6 +560,7 @@ class Layer:
     def scale_kernel(self, factor: float):
         return
     
+    
 class Flatten(Layer):
     def __init__(self, input_shape, start_dim=0, end_dim=None) -> None:
         super().__init__(input_shape)
@@ -576,13 +576,6 @@ class Flatten(Layer):
         batch_size = input_data.shape[0]
         return input_data.reshape((batch_size, ) + self.output_shape)
 
-'''
-#Test Flatten
-a = Flatten(input_shape=(28, 28))
-b = np.random.rand(10,28,28)
-c = a(b)
-print(c.shape, c)
-'''
 
 class Dropout(Layer):
     def __init__(self, p: float) -> None:
@@ -604,31 +597,27 @@ class Dropout(Layer):
         dLoss_per_output = dLoss_per_output * self.bernoulli_mask
         return dLoss_per_output, None
     
-'''
-# Test Dropout
-d = Dropout(0.25)    
-a = np.array([
-    [[1, 2], [3, 4]],
-    [[5, 6], [7, 8]]
-    ], dtype=object)
-print(a.shape, d(a))
-'''
 
 class BatchNormalization(Layer):
-    def __init__(self, in_features, epsilon:float=1e-7) -> None:
+    def __init__(self, in_features, epsilon:float=1e-7, **kwargs) -> None:
         super().__init__()
-        self.z = None
+        self.a = None
         self.x = None
         self.x_hat = None
         self.epsilon = epsilon
         self.kernel = np.ones(shape=(in_features))
         self.biases = np.zeros(shape=(in_features))
+        if kwargs:
+            if 'load_weights' in kwargs:
+                self.kernel, self.biases = kwargs['load_weights']
+            if 'freeze' in kwargs:
+                self.freeze = kwargs['freeze']
         self.curr_esperance, self.curr_variance = None, None
         self.running_esperance, self.running_variance = 0, 0
         self.batch_size, self.batch_step = 0, 0
     
     def get_output(self):
-        return self.z
+        return self.a
     
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         if training: 
@@ -644,8 +633,8 @@ class BatchNormalization(Layer):
             training_esperance = self.running_esperance / self.batch_step
             training_variance = (self.batch_size / (self.batch_size-1)) * (self.running_variance / self.batch_step) 
             self.x_hat = (input_data - training_esperance) / (np.sqrt(training_variance + self.epsilon))
-        self.z = self.x_hat * self.kernel + self.biases
-        return self.z
+        self.a = self.x_hat * self.kernel + self.biases
+        return self.a
     
     def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
         dLoss_per_x_hat = dLoss_per_output * self.kernel
@@ -667,25 +656,15 @@ class BatchNormalization(Layer):
     
     def update_params(self, gradient : np.ndarray):
         dGamma, dBeta = gradient
-        self.kernel += dGamma
-        if self.biases is not None: self.biases += dBeta
+        if not self.freeze:
+            self.kernel -= dGamma
+            if self.biases is not None: self.biases -= dBeta
     
     def get_params_count(self):
         num_params = np.prod(self.kernel.shape) 
         if self.biases is not None: num_params += self.biases.shape[0]
         return num_params
-'''
-# Test Batch Norm
-a=BatchNormalization(3)
-ones = np.ones((10, 3))
-input = np.random.randn(10, 3)
-b=a(input)
-print(b.shape)
-_, dL = Loss()(b, input)
-print("Before backward", dL)
-dL, _ = a.backward(dL)
-print("After backward", dL)
-'''
+
 
 class Dense(Layer):
     # -------------------------------------------------------------------#
@@ -716,19 +695,19 @@ class Dense(Layer):
                 self.kernel, self.biases = kwargs['load_weights']
             if 'freeze' in kwargs:
                 self.freeze = kwargs['freeze']
-        self.z = None
+        self.a = None
         self.x = None
     
     def get_output(self):
-        return self.activate(self.z)
+        return self.activate(self.a)
     
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         self.x = np.copy(input_data)
         input_data = super().__call__(input_data)       
-        self.z = np.dot(input_data, self.kernel) 
-        if self.biases is not None: self.z += self.biases
-        self.z = self.activate(self.z)
-        return self.z
+        z = np.dot(input_data, self.kernel) 
+        if self.biases is not None: z += self.biases
+        self.a = self.activate(z)
+        return self.a
     
     def get_params_count(self):
         num_params = np.prod(self.kernel.shape) 
@@ -742,16 +721,16 @@ class Dense(Layer):
         activation_function = globals()[self.activation.name]
         return activation_function(z)
         
-    def derivate(self, z: np.ndarray) -> np.ndarray:
+    def derivate(self, a: np.ndarray) -> np.ndarray:
         derivation_function = globals()["d"+self.activation.name]
-        return derivation_function(z)
+        return derivation_function(a)
 
     def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
-        dOut_per_z = self.derivate(self.z) # shape: z.shape
+        dOut_per_z = self.derivate(self.a) # shape: z.shape
         dLoss_per_z = dLoss_per_output * dOut_per_z # shape: z.shape
         dLoss_per_W = np.dot(self.x.T, dLoss_per_z) # shape: W.shape
         dLoss_per_b = np.sum(dLoss_per_z, axis=0) # shape: b.shape
-        dLoss_per_output = np.dot(dLoss_per_output * dOut_per_z, self.kernel.T) # shape: x.shape
+        dLoss_per_output = np.dot(dLoss_per_z, self.kernel.T) # shape: x.shape
         return dLoss_per_output, [dLoss_per_W, dLoss_per_b]
         
     def update_params(self, gradient : np.ndarray, **kwargs):
@@ -766,14 +745,7 @@ class Dense(Layer):
     
     def scale_kernel(self, factor: float):
         self.kernel *= factor
-'''
-#Test Dense
-a = Dense(in_features=3, out_features=2, activation="sigmoid")
-b = a(np.random.randn(2, 3))
-c = a.derivate(b)
-print(b.shape, b)
-print(c.shape, c)
-'''
+
 
 class Embedding(Layer):
     def __init__(self, input_dim : int, output_dim : int, seq_length : int, **kwargs) -> None:
@@ -786,16 +758,16 @@ class Embedding(Layer):
             if 'freeze' in kwargs:
                 self.freeze = kwargs['freeze']
         self.x = None
-        self.z = None
+        self.a = None
 
     def get_output(self):
-        return self.z
+        return self.a
     
     def __call__(self, input_data: np.ndarray[int], training : bool = True) -> np.ndarray:
         # input_data should be of shape (batch_size, sequence_length)
         self.x = input_data
-        self.z = self.kernel[input_data]
-        return self.z
+        self.a = self.kernel[input_data]
+        return self.a
     
     def backward(self, dLoss_per_output) -> tuple[np.ndarray]:
         # dLoss_per_output of shape (batch_size, sequence_length, out_dim)
@@ -808,10 +780,11 @@ class Embedding(Layer):
     def update_params(self, gradient: np.ndarray):
         # print("Gradient embedding : ", sum([np.sum(g) for g in gradient]))
         if not self.freeze:
-            self.kernel += gradient[0]
+            self.kernel -= gradient[0]
         
     def get_params_count(self):
         return np.prod(self.kernel.shape) 
+
 
 class RNN(Layer):
     def __init__(self, in_features : int, hidden_features : int, architecture : str | RnnArchitecture = "many_to_one", 
@@ -828,17 +801,17 @@ class RNN(Layer):
         self.architecture = architecture
         self.x = None # shape (m, Tx, nx)
         self.a = None # shape (m, Tx, na)
-        self.Waa = orthogonal_initializer(shape=(hidden_features, hidden_features)) # shape (na, na)
-        self.Wxa = glorot_normal_initializer(shape=(in_features, hidden_features)) # shape (nx, na)
-        self.ba = np.zeros((hidden_features, )) # shape (na, )
+        self.recurrent_kernel = orthogonal_initializer(shape=(hidden_features, hidden_features)) # shape (na, na)
+        self.kernel = glorot_normal_initializer(shape=(in_features, hidden_features)) # shape (nx, na)
+        self.biases= np.zeros((hidden_features, )) # shape (na, )
         if kwargs:
             if 'load_weights' in kwargs:
-                self.Wxa, self.Waa, self.ba = kwargs['load_weights']
+                self.kernel, self.recurrent_kernel, self.biases= kwargs['load_weights']
             if 'freeze' in kwargs:
                 self.freeze = kwargs['freeze']
     
     def get_params_count(self):
-        num_params = np.prod(self.Waa.shape) + np.prod(self.Wxa.shape) + len(self.ba)
+        num_params = np.prod(self.recurrent_kernel.shape) + np.prod(self.kernel.shape) + len(self.biases)
         return num_params
     
     def get_output(self):
@@ -846,7 +819,7 @@ class RNN(Layer):
     
     def forward_cell(self, input_data_t: np.ndarray, a_prev : np.ndarray) -> np.ndarray:
         # input_data shape : (m, nx) - a_prev shape : (m, na)
-        za_t = np.dot(input_data_t, self.Wxa) + np.dot(a_prev, self.Waa) + self.ba
+        za_t = np.dot(input_data_t, self.kernel) + np.dot(a_prev, self.recurrent_kernel) + self.biases
         activation_function = globals()[self.activation.name]       
         a_next = activation_function(za_t)
         return a_next
@@ -854,22 +827,22 @@ class RNN(Layer):
     def backward_cell(self, dLoss_per_a_next : np.ndarray, t : int) -> tuple[np.ndarray]:
         derivation_function = globals()["d"+self.activation.name]
         dLoss_per_za_next = dLoss_per_a_next * derivation_function(self.a[:, t])
-        dLoss_per_ba = np.sum(dLoss_per_za_next, axis=0)
-        dLoss_per_Wxa = np.dot(self.x[:, t].T, dLoss_per_za_next)
-        dLoss_per_x_t = np.dot(dLoss_per_za_next, self.Wxa.T)
-        dLoss_per_a_prev = np.dot(dLoss_per_za_next, self.Waa.T)
-        dLoss_per_Waa = np.dot(self.a[:, t-1].T, dLoss_per_za_next)
-        self.time_cache['dWaa'] += dLoss_per_Waa
-        self.time_cache['dWxa'] += dLoss_per_Wxa
-        self.time_cache['dba'] += dLoss_per_ba
+        dLoss_per_biases= np.sum(dLoss_per_za_next, axis=0)
+        dLoss_per_kernel = np.dot(self.x[:, t].T, dLoss_per_za_next)
+        dLoss_per_x_t = np.dot(dLoss_per_za_next, self.kernel.T)
+        dLoss_per_a_prev = np.dot(dLoss_per_za_next, self.recurrent_kernel.T)
+        dLoss_per_recurrent_kernel = np.dot(self.a[:, t-1].T, dLoss_per_za_next)
+        self.time_cache['drecurrent_kernel'] += dLoss_per_recurrent_kernel
+        self.time_cache['dkernel'] += dLoss_per_kernel
+        self.time_cache['dbiases'] += dLoss_per_biases
         return dLoss_per_a_prev, dLoss_per_x_t
     
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         # Input should be like (batch_size, seq, in_features)
         m, self.T_x, nx = input_data.shape
         self.x = input_data
-        self.a = np.zeros(shape=(m, self.T_x, self.ba.shape[0]))
-        a_prev = np.zeros((m, self.ba.shape[0]))       
+        self.a = np.zeros(shape=(m, self.T_x, self.biases.shape[0]))
+        a_prev = np.zeros((m, self.biases.shape[0]))       
         for t in range(self.T_x):
             x_t = input_data[:, t]
             a_prev = self.forward_cell(x_t, a_prev)
@@ -880,43 +853,30 @@ class RNN(Layer):
         if self.architecture == RnnArchitecture.many_to_one:
             return a_prev
     
-    def backward(self, dLoss_per_a : np.ndarray):
-        # dLoss_per_a shape : (m, Tx, na)
-        self.time_cache = {'dWaa': 0, 'dWxa': 0, 'dba': 0}
+    # dLoss_per_a shape : (m, Tx, na)
+    #if self.architecture == RnnArchitecture.many_to_many:
+    #        dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a[:, t], t)
+    def backward(self, dLoss_per_a : np.ndarray):        
+        self.time_cache = {'drecurrent_kernel': 0, 'dkernel': 0, 'dbiases': 0}
         dLoss_per_x = np.zeros_like(self.x)
         dLoss_per_a_prev = dLoss_per_a
-        for t in reversed(range(self.T_x)):
-            if self.architecture == RnnArchitecture.many_to_many:
-                dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a[:, t], t)
-            elif self.architecture == RnnArchitecture.many_to_one:
-                dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a_prev, t)
+        for t in reversed(range(self.T_x)):            
+            dLoss_per_a_prev, dLoss_per_x_t = self.backward_cell(dLoss_per_a_prev, t)
             dLoss_per_x[:, t] = dLoss_per_x_t
         cumul_gradients = [gradient for gradient in self.time_cache.values()]
         return dLoss_per_x, cumul_gradients
     
     def update_params(self, gradient : np.ndarray):
-        # print("Gradient RNN : ", sum([np.sum(g) for g in gradient]))
         if not self.freeze:
-            self.Waa += gradient[0]
-            self.Wxa += gradient[1]
-            self.ba += gradient[2]
+            self.recurrent_kernel -= gradient[0]
+            self.kernel -= gradient[1]
+            self.biases-= gradient[2]
         return
 
-'''
-# Test Reccurent Layer
-in_features=5
-hidden_features=3
-batch = 10
-T = 5
-a = RNN(in_features, hidden_features)
-input = np.random.randn(batch, T, in_features)
-y = a(input)
-print(y.shape)
-'''
 
 class LSTM(Layer):
     def __init__(self, in_features : int, hidden_features : int, architecture : str | RnnArchitecture = "many_to_one", 
-                 activation : str | Activation= "tanh") -> None:
+                 activation : str | Activation= "tanh", **kwargs) -> None:
         # Input should be like (in_features, batch_size)
         super().__init__()
         if not isinstance(activation, Activation):
@@ -929,32 +889,23 @@ class LSTM(Layer):
         self.architecture = architecture
         
         self.n_i, self.n_a, self.T_x = in_features, hidden_features, 0
-        # Gates and cells info
-        self.Wf = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # forget gate weights
-        self.bf = np.zeros(shape=(hidden_features,)) # forget gate bias
-        self.ft = None # forget gate shape (m, Tx, na)
+        # Kernel weights to multiply input data -- stack of 4 weights (gates weights)
+        # in order Wu, Wf, Wc, Wo
+        self.kernel =  glorot_uniform_initializer((in_features, hidden_features * 4))
+        self.recurrent_kernel = orthogonal_initializer((hidden_features , hidden_features * 4))
+        self.biases = np.zeros(shape=(hidden_features * 4,))
+        if kwargs:
+            if 'load_weights' in kwargs:
+                self.kernel, self.recurrent_kernel, self.biases= kwargs['load_weights']
+            if 'freeze' in kwargs:
+                self.freeze = kwargs['freeze']
+        self.ft, self.ut, self.ot = None, None, None # forget gate shape (m, Tx, na)
+        self.x, self.c, self.a, self.candidate = None, None, None, None
         
-        self.Wu = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # update gate weights
-        self.bu = np.zeros(shape=(hidden_features,)) # update gate bias
-        self.ut = None # update gate shape (m, Tx, na)
-        
-        self.Wo = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # output gate weights
-        self.bo = np.zeros(shape=(hidden_features,)) # output gate bias
-        self.ot = None # output gate shape (m, Tx, na)
-        
-        self.Wc = glorot_uniform_initializer(shape=(in_features + hidden_features, hidden_features)) # candidate state weights
-        self.bc = np.zeros(shape=(hidden_features,)) # candidate state bias
-        
-        self.x = None # shape (m, Tx, nx)
-        self.c = None # cell state shape (m, Tx, na)
-        self.candidate = None # candidate cell state shape (m, Tx, na)
-        self.a = None # hidden state shape (m, Tx, na)
-        
-        self.time_cache = {'dWf': [], 'dWu': [], 'dWo': [], 'dWc' : [], 'bf' : [], 'bu': [], 'bo': [], 'bc': []}
+        self.time_cache = {'dkernel' : [], 'drecurrent_kernel': [], 'dbiases': []}
     
     def get_params_count(self):
-        num_params = np.prod(self.Wf.shape) + np.prod(self.Wu.shape) + np.prod(self.Wo.shape) + np.prod(self.Wc.shape) + \
-            len(self.bf) + len(self.bu) + len(self.bo) + len(self.bc)
+        num_params = np.prod(self.kernel.shape) + np.prod(self.recurrent_kernel.shape) + len(self.biases)
         return num_params
 
     def get_output(self):
@@ -962,20 +913,17 @@ class LSTM(Layer):
     
     def forward_cell(self, input_data_t: np.ndarray, a_prev : np.ndarray, c_prev : np.ndarray) -> np.ndarray:
         # input_data shape : (m, nx) - a_prev shape : (m, na) - c_prev shape : (m, na)
-        # print("Shapes", input_data_t.shape, a_prev.shape)
-        concat = np.concatenate((a_prev, input_data_t), axis=-1)
-        ft = sigmoid(np.dot(concat, self.Wf) + self.bf)
-        ut = sigmoid(np.dot(concat, self.Wu) + self.bu)
-        candidate = tanh(np.dot(concat, self.Wc) + self.bc)
-        c_next = ft * c_prev + ut * candidate
-        ot = sigmoid(np.dot(concat, self.Wo) + self.bo)
-        activation_function = globals()[self.activation.name]       
+        activation_function = globals()[self.activation.name]
+        z = (np.dot(input_data_t, self.kernel) + 
+                    np.dot(a_prev, self.recurrent_kernel) + self.biases)
+        z0, z1, z2, z3 = np.split(z, 4, axis=1)
+        ut, ft, candidate, ot = sigmoid(z0), sigmoid(z1), activation_function(z2), sigmoid(z3)
+        c_next = ft * c_prev + ut * candidate               
         a_next = ot * activation_function(c_next) 
         return a_next, c_next, candidate, ft, ut, ot
     
     def backward_cell(self, dLoss_per_a_t : np.ndarray, dLoss_per_c_t : np.ndarray, t : int) -> tuple[np.ndarray]:
         xt = self.x[:, t]
-        concat = np.concatenate((self.a[:, t], xt), axis=-1)
         
         activation_function = globals()[self.activation.name]
         derivation_function = globals()["d"+self.activation.name]
@@ -983,48 +931,50 @@ class LSTM(Layer):
         
         dLoss_per_ot = dLoss_per_a_t * activation_function(self.c[:, t])  * dsigmoid(self.ot[:, t])
         
-        dLoss_per_candidate = dtanh(self.candidate[:, t]) * (dLoss_per_c_t * self.ut[:, t] \
-            + self.ot[:, t] * derivation_function(self.c[:, t]) * self.ut[:, t] * dLoss_per_a_t)
+        dLoss_per_candidate = dtanh(self.candidate[:, t]) * (dLoss_per_c_t * self.ut[:, t]) #\
+            #+ self.ot[:, t] * derivation_function(self.c[:, t]) * self.ut[:, t] * dLoss_per_a_t)
         
         dLoss_per_ut = dsigmoid(self.ut[:, t]) * (dLoss_per_c_t * self.candidate[:, t] \
             + self.ot[:, t] * derivation_function(self.c[:, t]) * self.candidate[:, t] * dLoss_per_a_t)
         
-        dLoss_per_ft = dsigmoid(self.ft[:, t]) * (dLoss_per_c_t * self.c[:, t-1] \
-            + self.ot[:, t] * derivation_function(self.c[:, t]) * self.c[:, t-1] * dLoss_per_a_t)
+        dLoss_per_ft = dsigmoid(self.ft[:, t]) * (dLoss_per_c_t * self.c[:, t-1] )#\
+            #+ self.ot[:, t] * derivation_function(self.c[:, t]) * self.c[:, t-1] * dLoss_per_a_t)
             
-        dLoss_per_Wo = np.dot(concat.T, dLoss_per_ot)
-        dLoss_per_Wu = np.dot(concat.T, dLoss_per_ut)
-        dLoss_per_Wf = np.dot(concat.T, dLoss_per_ft)
-        dLoss_per_Wc = np.dot(concat.T, dLoss_per_candidate)
+        dLoss_per_Wox, dLoss_per_Woh = np.dot(xt.T, dLoss_per_ot), np.dot(self.a[:, t].T, dLoss_per_ot)
+        dLoss_per_Wux, dLoss_per_Wuh = np.dot(xt.T, dLoss_per_ut), np.dot(self.a[:, t].T, dLoss_per_ut)
+        dLoss_per_Wfx, dLoss_per_Wfh = np.dot(xt.T, dLoss_per_ft), np.dot(self.a[:, t].T, dLoss_per_ft)
+        dLoss_per_Wcx, dLoss_per_Wch = np.dot(xt.T, dLoss_per_candidate), np.dot(self.a[:, t].T, dLoss_per_candidate)
         
         dLoss_per_bo = np.sum(dLoss_per_ot, axis=0)
         dLoss_per_bu = np.sum(dLoss_per_ut, axis=0)
         dLoss_per_bf = np.sum(dLoss_per_ft, axis=0)
         dLoss_per_bc = np.sum(dLoss_per_candidate, axis=0)
+        
+        dLoss_per_kernel = np.concatenate((dLoss_per_Wux, dLoss_per_Wfx, dLoss_per_Wcx, dLoss_per_Wox), axis=1)
+        dLoss_per_recurrent_kernel = np.concatenate((dLoss_per_Wuh, dLoss_per_Wfh, dLoss_per_Wch, dLoss_per_Woh), axis=1)
+        dLoss_per_biases = np.concatenate((dLoss_per_bu, dLoss_per_bf, dLoss_per_bc, dLoss_per_bo))
             
-        self.time_cache['dWf'].append(dLoss_per_Wf)
-        self.time_cache['dWu'].append(dLoss_per_Wu)
-        self.time_cache['dWo'].append(dLoss_per_Wo)
-        self.time_cache['dWc'].append(dLoss_per_Wc)
-        self.time_cache['dbf'].append(dLoss_per_bf)
-        self.time_cache['dbu'].append(dLoss_per_bu)
-        self.time_cache['dbo'].append(dLoss_per_bo)
-        self.time_cache['dbc'].append(dLoss_per_bc)
+        self.time_cache['dkernel'].append(dLoss_per_kernel)
+        self.time_cache['drecurrent_kernel'].append(dLoss_per_recurrent_kernel)
+        self.time_cache['dbiases'].append(dLoss_per_biases)
         
         # Compute derivatives w.r.t previous hidden state, previous memory state and input.
-        dLoss_per_concat = np.dot(dLoss_per_ft, self.Wf.T) + np.dot(dLoss_per_ot, self.Wo.T) + \
-            np.dot(dLoss_per_ut, self.Wu.T) + np.dot(dLoss_per_candidate, self.Wc.T)
-        dLoss_per_x_t = dLoss_per_concat[:, : self.n_i]
-        dLoss_per_a_prev = dLoss_per_concat[:, self.n_i:]
-        dLoss_per_c_prev = dLoss_per_c_t * self.ft[:, t] \
-            + self.ot[:, t] *  derivation_function(self.c[:, t]) * self.ft[:, t] * dLoss_per_a_t
+        Wux, Wfx, Wcx, Wox = np.split(self.kernel, 4, axis=1)
+        Wuh, Wfh, Wch, Woh = np.split(self.recurrent_kernel, 4, axis=1)
+        dLoss_per_x_t = np.dot(dLoss_per_ft, Wfx.T) + np.dot(dLoss_per_ot, Wox.T) #+ \
+            #np.dot(dLoss_per_ut, Wux.T) + np.dot(dLoss_per_candidate, Wcx.T)
+        dLoss_per_a_prev = np.dot(dLoss_per_ft, Wfh.T) + np.dot(dLoss_per_ot, Woh.T) #+ \
+            #np.dot(dLoss_per_ut, Wuh.T) + np.dot(dLoss_per_candidate, Wch.T)
+
+        dLoss_per_c_prev = dLoss_per_c_t * self.ft[:, t] #\
+            #+ self.ot[:, t] *  derivation_function(self.c[:, t]) * self.ft[:, t] * dLoss_per_a_t
         
         return dLoss_per_x_t, dLoss_per_a_prev, dLoss_per_c_prev
     
     def __call__(self, input_data: np.ndarray, training : bool = True) -> np.ndarray:
         # Input should be like (batch_size, seq, in_features)
-        m, self.T_x, nx = input_data.shape
-        na = self.bf.shape[0]
+        m, self.T_x, _ = input_data.shape
+        na = self.n_a
         self.x = input_data
         self.a = np.random.randn(m, self.T_x, na)
         self.c = np.random.randn(m, self.T_x, na) # np.zeros(shape=(m, Tx, na))
@@ -1053,7 +1003,7 @@ class LSTM(Layer):
 
     def backward(self, dLoss_per_a : np.ndarray):
         # dLoss_per_a shape : (m, na)
-        self.time_cache = {'dWf': [], 'dWu': [], 'dWo': [], 'dWc' : [], 'dbf' : [], 'dbu': [], 'dbo': [], 'dbc': []}
+        self.time_cache = {'dkernel' : [], 'drecurrent_kernel': [], 'dbiases': []}
         dLoss_per_x = np.zeros_like(self.x)
         dLoss_per_a_prev = dLoss_per_a
         dLoss_per_c_prev = np.zeros_like(dLoss_per_a_prev)
@@ -1067,14 +1017,10 @@ class LSTM(Layer):
         return dLoss_per_x, cumul_gradients
     
     def update_params(self, gradient : np.ndarray):
-        self.Wf += gradient[0]
-        self.Wu += gradient[1]
-        self.Wo += gradient[2]
-        self.Wc += gradient[3]
-        self.bf += gradient[4]
-        self.bu += gradient[5]
-        self.bo += gradient[6]
-        self.bc += gradient[7]
+        if not self.freeze:
+            self.kernel -= gradient[0]
+            self.recurrent_kernel -= gradient[1]
+            self.biases -= gradient[2]
         return
     
     
@@ -1222,7 +1168,7 @@ class Sequential:
                 # if self.regularizer:
                 #    self.cache[-1]['gradients'][l_index][0] += self.regularizer.gradients_reg(layer.kernel) # Attention
                 if self.optimizer:
-                    gradients = self.optimizer(gradients, l_index, step=self.training_steps_tracker, epoch=len(self.cache)) 
+                    gradients = self.optimizer(gradients, l_index, step=self.training_steps_tracker, epoch=len(self.cache)-1) 
                 layer.update_params(gradients)
                 self.cache[-1]['gradients'][l_index] = gradients
                     
@@ -1357,7 +1303,6 @@ class Sequential:
             pickle.dump(self, save_file)
         
     def display_losses(self, *args, **kwargs):
-        return
         if not args and not kwargs:
             train_losses = self.get_cache('train_loss')
             val_losses = self.get_cache('val_loss')           
